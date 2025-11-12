@@ -79,17 +79,32 @@ class NNRequest(BaseModel):
 class NNResponse(BaseModel):
     processedPayload: SavedWork
 
+def recursively_set_green(items: List[Item]) -> List[Item]:
+    """
+    Recursively sets the color to green for all items and their children.
+    """
+    return [
+        item.copy(update={"color": "green"})
+        if item.children is None
+        else item.copy(update={"color": "green", "children": recursively_set_green(item.children)})
+        for item in items
+    ]
+
 @app.post("/process", response_model=NNResponse)
 async def process_nn(request: NNRequest):
     """
-    Echoes back the same payload for now.
-    TODO: Implement NN logic here (e.g., modify itemsByResolution with AI suggestions).
+    Processes the payload by setting all item colors to green.
+    TODO: Implement full NN logic here (e.g., AI-based suggestions beyond color).
     """
-    # For demo: Just return the input unchanged
-    processed_payload = request.payload
+    # Start with the input payload
+    processed_payload = request.payload.model_copy(deep=True)
+    
+    # Apply green color to all items across resolutions (including nested children)
+    for resolution, items in processed_payload.itemsByResolution.items():
+        processed_payload.itemsByResolution[resolution] = recursively_set_green(items)
     
     # Optional: Add a timestamp or log for debugging
-    print(f"Received payload at {datetime.now().isoformat()}: {len(processed_payload.itemsByResolution)} resolutions")
+    print(f"Processed payload at {datetime.now().isoformat()}: Set green color for {sum(len(items) for items in processed_payload.itemsByResolution.values())} items across {len(processed_payload.itemsByResolution)} resolutions")
     
     return NNResponse(processedPayload=processed_payload)
 
