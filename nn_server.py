@@ -7,6 +7,17 @@ from typing import Dict, Any, List, Optional
 import uvicorn
 from datetime import datetime
 import json
+import copy
+import sys
+
+# Import GNN model and data processing utilities
+from gnn_model import LayoutGNN, predict_resolution_properties
+from data_processor import (
+    clean_items_for_prediction,
+    merge_predicted_items,
+    get_resolution_dimensions
+)
+import torch
 
 app = FastAPI(title="PageCraft NN Proxy Server", version="1.0.0")
 
@@ -37,16 +48,77 @@ class SavedWork(BaseModel):
     gallery: Optional[List[Any]] = []
 
 
+# Initialize GNN model (in production, load from checkpoint)
+# For now, create a new model instance
+# In production, you would load a trained model:
+# model = LayoutGNN()
+# model.load_state_dict(torch.load('model_checkpoint.pth'))
+# model.eval()
+
+# Lazy initialization - model will be created on first use
+_model = None
+
+def get_model() -> LayoutGNN:
+    """Get or create the GNN model instance."""
+    global _model
+    if _model is None:
+        _model = LayoutGNN()
+        _model.eval()
+        # In production, load trained weights here
+        # _model.load_state_dict(torch.load('model_checkpoint.pth'))
+    return _model
+
+
+def find_desktop_resolution(items_by_resolution: Dict[str, Any]) -> Optional[str]:
+    """
+    Find the desktop resolution key.
+    Desktop is typically the one with the most items or contains 'Desktop' in name.
+    """
+    desktop_candidates = []
+    
+    for resolution, items in items_by_resolution.items():
+        if not isinstance(items, list):
+            continue
+        
+        # Check if it's explicitly desktop
+        if 'Desktop' in resolution or 'desktop' in resolution.lower():
+            if items:  # Has items
+                return resolution
+            desktop_candidates.append((resolution, len(items)))
+        elif items:  # Has items but not explicitly desktop
+            desktop_candidates.append((resolution, len(items)))
+    
+    # Return the resolution with the most items
+    if desktop_candidates:
+        desktop_candidates.sort(key=lambda x: x[1], reverse=True)
+        return desktop_candidates[0][0]
+    
+    return None
+
 
 @app.post("/process")
 async def process_nn(request: Request):
     """Processes layout data using PageCraftML GNN. Accepts multiple request structures."""
-    import copy
     
     # Parse JSON body
     try:
         raw_body = await request.body()
         body = json.loads(raw_body.decode('utf-8'))
+        
+        # Debug: Check raw body structure
+        print(f"DEBUG: Raw body type: {type(body)}", flush=True)
+        if isinstance(body, dict):
+            print(f"DEBUG: Body keys: {list(body.keys())}", flush=True)
+            if 'pages' in body:
+                print(f"DEBUG: Pages structure: {type(body.get('pages'))}", flush=True)
+                if isinstance(body.get('pages'), list) and len(body['pages']) > 0:
+                    first_page = body['pages'][0]
+                    print(f"DEBUG: First page keys: {list(first_page.keys()) if isinstance(first_page, dict) else 'N/A'}", flush=True)
+                    if isinstance(first_page, dict) and 'data' in first_page:
+                        data = first_page['data']
+                        print(f"DEBUG: Data keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}", flush=True)
+                        if isinstance(data, dict) and 'itemsByResolution' in data:
+                            print(f"DEBUG: itemsByResolution in data has {len(data['itemsByResolution'])} keys: {list(data['itemsByResolution'].keys())}", flush=True)
     except Exception as e:
         return JSONResponse(
             status_code=400,
@@ -98,39 +170,192 @@ async def process_nn(request: Request):
             content={"error": "'itemsByResolution' must be an object"}
         )
     
-    # Process the payload
+    # Process the payload using GNN
     processed_payload = copy.deepcopy(payload)
     
-    try:
-        # Color all items in all resolutions green (placeholder ML processing)
-        for resolution, items in processed_payload['itemsByResolution'].items():
-            colored_items = []
-            for item in items:
-                # Convert Item object to dict if needed
-                if hasattr(item, 'model_dump'):
-                    item_dict = item.model_dump()
-                elif hasattr(item, 'dict'):
-                    item_dict = item.dict()
-                else:
-                    item_dict = dict(item) if hasattr(item, '__dict__') else item
-
-                # Add green color and ensure basic properties
-                item_dict['color'] = '#00FF00'
-                item_dict['position'] = item_dict.get('position', 'absolute')
-                item_dict['x'] = item_dict.get('x', 0)
-                item_dict['y'] = item_dict.get('y', 0)
-                item_dict['width'] = item_dict.get('width', 100)
-                item_dict['height'] = item_dict.get('height', 50)
-
-                colored_items.append(item_dict)
-
-            processed_payload['itemsByResolution'][resolution] = colored_items
-
-    except Exception as e:
-        # Return payload unchanged on error
-        pass
+    # Debug: Check what we received
+    print(f"DEBUG: Payload keys: {list(payload.keys())}", flush=True)
+    if 'itemsByResolution' in payload:
+        print(f"DEBUG: itemsByResolution keys: {list(payload['itemsByResolution'].keys())}", flush=True)
+        print(f"DEBUG: itemsByResolution values lengths: {[(k, len(v) if isinstance(v, list) else 'N/A') for k, v in payload['itemsByResolution'].items()]}", flush=True)
     
-    return {"processedPayload": processed_payload}
+    try:
+        items_by_resolution = processed_payload['itemsByResolution']
+        print(f"DEBUG: After copy, items_by_resolution keys: {list(items_by_resolution.keys())}", flush=True)
+        
+        # Step 1: Find desktop resolution (the main version with items)
+        desktop_resolution = find_desktop_resolution(items_by_resolution)
+        
+        if not desktop_resolution:
+            # No desktop found, return unchanged
+            return {"processedPayload": processed_payload}
+        
+        desktop_items = items_by_resolution.get(desktop_resolution, [])
+        
+        if not desktop_items:
+            # Desktop has no items, return unchanged
+            return {"processedPayload": processed_payload}
+        
+        # Convert items to dicts if needed
+        desktop_items_dicts = []
+        for item in desktop_items:
+            if hasattr(item, 'model_dump'):
+                item_dict = item.model_dump()
+            elif hasattr(item, 'dict'):
+                item_dict = item.dict()
+            elif isinstance(item, dict):
+                item_dict = item
+            else:
+                item_dict = dict(item) if hasattr(item, '__dict__') else item
+            desktop_items_dicts.append(item_dict)
+        
+        # Step 2: Clean desktop items - extract only size/alignment relevant properties
+        cleaned_desktop_items = clean_items_for_prediction(desktop_items_dicts)
+        
+        # Check if we have any static items after cleaning
+        if not cleaned_desktop_items:
+            print(f"Warning: No static items found after filtering. Desktop had {len(desktop_items_dicts)} items.")
+            return {"processedPayload": processed_payload}
+        
+        print(f"Processing {len(cleaned_desktop_items)} static items for desktop resolution: {desktop_resolution}")
+        
+        # Get desktop dimensions
+        desktop_width, desktop_height = get_resolution_dimensions(desktop_resolution)
+        
+        # Step 3: Process with GNN for each non-desktop resolution
+        model = get_model()
+        
+        # Standard resolutions to predict for (if not already present)
+        standard_resolutions = [
+            "Laptop (1366x768)",
+            "Tablet (768x1024)",
+            "iPad Pro (1024x1366)",
+            "iPhone 14 Pro (393x852)",
+            "Pixel 7 (412x915)",
+            "Galaxy S22 (360x780)",
+            "Mobile (375x667)"
+        ]
+        
+        # Ensure all standard resolutions exist in items_by_resolution (initialize as empty if missing)
+        for res in standard_resolutions:
+            if res not in items_by_resolution:
+                items_by_resolution[res] = []
+                processed_payload['itemsByResolution'][res] = []
+        
+        resolutions_processed = 0
+        print(f"Total resolutions to check: {len(items_by_resolution)}", flush=True)
+        print(f"Resolution keys: {list(items_by_resolution.keys())}", flush=True)
+        
+        for resolution, items in items_by_resolution.items():
+            # Skip desktop resolution (it's our source)
+            if resolution == desktop_resolution:
+                print(f"Skipping desktop resolution: {resolution}")
+                continue
+            
+            # Debug: Check what we're getting
+            print(f"Checking resolution: '{resolution}'", flush=True)
+            print(f"  - Type: {type(items)}", flush=True)
+            print(f"  - Is list: {isinstance(items, list)}", flush=True)
+            if isinstance(items, list):
+                print(f"  - Length: {len(items)}", flush=True)
+                print(f"  - Value: {items}", flush=True)
+            else:
+                print(f"  - Value: {items}", flush=True)
+            
+            # Only process if resolution is empty or has minimal items
+            if isinstance(items, list) and len(items) == 0:
+                # Get target resolution dimensions
+                target_width, target_height = get_resolution_dimensions(resolution)
+                
+                print(f"Predicting for resolution: {resolution} ({target_width}x{target_height})")
+                
+                # Step 4: Predict properties for this resolution using GNN
+                predicted_items = predict_resolution_properties(
+                    model=model,
+                    desktop_items=cleaned_desktop_items,
+                    target_width=target_width,
+                    target_height=target_height,
+                    desktop_width=desktop_width,
+                    desktop_height=desktop_height
+                )
+                
+                if not predicted_items:
+                    print(f"Warning: No predicted items returned for {resolution}")
+                    continue
+                
+                print(f"DEBUG: Got {len(predicted_items)} predicted items for {resolution}")
+                if predicted_items:
+                    print(f"DEBUG: First predicted item keys: {list(predicted_items[0].keys())}")
+                
+                # Step 5: Create minimal items with only size/alignment properties
+                merged_items = merge_predicted_items(
+                    original_items=desktop_items_dicts,
+                    predicted_items=predicted_items
+                )
+                
+                print(f"DEBUG: Merged items count: {len(merged_items)}")
+                if merged_items:
+                    print(f"DEBUG: First merged item: {merged_items[0]}")
+                
+                # Update the resolution with merged items
+                # Update both references to ensure consistency
+                items_by_resolution[resolution] = merged_items
+                processed_payload['itemsByResolution'][resolution] = merged_items
+                
+                # Verify the update worked
+                verify_items = processed_payload['itemsByResolution'].get(resolution, [])
+                print(f"VERIFY: Updated {resolution} - stored {len(verify_items)} items", flush=True)
+                
+                resolutions_processed += 1
+                print(f"Successfully processed {resolution}: {len(merged_items)} items")
+        
+        print(f"Processed {resolutions_processed} resolutions")
+        
+        # Debug: Check final output
+        print(f"DEBUG: Final processed_payload['itemsByResolution'] keys: {list(processed_payload['itemsByResolution'].keys())}")
+        for res, items in processed_payload['itemsByResolution'].items():
+            if res != desktop_resolution:
+                print(f"DEBUG: {res} has {len(items) if isinstance(items, list) else 'N/A'} items")
+                if isinstance(items, list) and len(items) > 0:
+                    print(f"DEBUG: First item in {res}: {items[0]}")
+        
+        if resolutions_processed == 0:
+            print("Warning: No resolutions were processed. Check if resolutions are empty arrays.")
+            print(f"Debug: items_by_resolution contents: {list(items_by_resolution.keys())}")
+            for res, items in items_by_resolution.items():
+                if res != desktop_resolution:
+                    print(f"  {res}: {type(items)} = {items}")
+        
+    except Exception as e:
+        # Log error but return payload unchanged
+        import traceback
+        error_msg = f"Error in GNN processing: {str(e)}"
+        print(error_msg)
+        print(traceback.format_exc())
+        # Return error information in response for debugging
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": error_msg,
+                "processedPayload": processed_payload,
+                "traceback": traceback.format_exc()
+            }
+        )
+    
+    # Final verification - ensure items are actually in the response
+    final_response = {"processedPayload": processed_payload}
+    
+    # Verify items are in response
+    if 'itemsByResolution' in processed_payload:
+        for res, items in processed_payload['itemsByResolution'].items():
+            if res != desktop_resolution:
+                item_count = len(items) if isinstance(items, list) else 0
+                if item_count > 0:
+                    print(f"FINAL CHECK: {res} has {item_count} items in response", flush=True)
+                else:
+                    print(f"FINAL CHECK: WARNING - {res} is EMPTY in response!", flush=True)
+    
+    return final_response
 
 @app.get("/")
 async def root():
